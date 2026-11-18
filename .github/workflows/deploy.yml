@@ -1,0 +1,95 @@
+name: Practice 7 deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: p7-production
+  cancel-in-progress: false
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m unittest discover -s tests -v
+      - run: |
+          python -m pip install cfn-lint
+          cfn-lint --non-zero-exit-code error infra/app.yaml
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STACK_NAME: p7-lab
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Identity
+        run: aws sts get-caller-identity
+      - name: Read stack outputs
+        run: |
+          set -euo pipefail
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" > stack.json
+          python - <<'PY'
+          import json, os
+          outputs = {v['OutputKey']: v['OutputValue'] for v in json.load(open('stack.json'))['Stacks'][0]['Outputs']}
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              for key, value in [('ECR_REPO',outputs['EcrUri']), ('APP_URL',outputs['AppUrl']), ('CLUSTER',outputs['ClusterName']), ('SERVICE',outputs['ServiceArn'])]:
+                  f.write(f'{key}={value}\n')
+          PY
+      - name: ECR login
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password | docker login -u AWS --password-stdin "${ECR_REPO%%/*}"
+      - name: Build and push SHA image
+        run: |
+          set -euo pipefail
+          IMAGE="$ECR_REPO:$GITHUB_SHA"
+          REPO_NAME="${ECR_REPO#*/}"
+          EXISTING=$(aws ecr list-images --repository-name "$REPO_NAME" --filter tagStatus=TAGGED --query "imageIds[?imageTag=='$GITHUB_SHA'].imageTag" --output text)
+          if [ -z "$EXISTING" ]; then
+            docker build --platform linux/amd64 -t "$IMAGE" .
+            docker push "$IMAGE"
+          else
+            echo "Reuse immutable image $IMAGE"
+          fi
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Deploy CloudFormation
+        run: |
+          aws cloudformation deploy --stack-name "$STACK_NAME"             --template-file infra/app.yaml             --parameter-overrides ImageTag="$GITHUB_SHA" DesiredCount=1             --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
+      - name: Verify service and image
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+          TD=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0].taskDefinition' --output text)
+          aws ecs describe-task-definition --task-definition "$TD" > td.json
+          python - <<'PY'
+          import json, os
+          td=json.load(open('td.json'))['taskDefinition']
+          assert os.environ['IMAGE'] in [c['image'] for c in td['containerDefinitions']]
+          print(td['taskDefinitionArn'])
+          print('Verified image:', os.environ['IMAGE'])
+          PY
+      - name: Smoke tests and deployed commit
+        run: |
+          set -euo pipefail
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 10 --connect-timeout 10 --max-time 30 "$APP_URL/health"
+          curl -fsS --retry 10 --retry-all-errors --retry-delay 10 --connect-timeout 10 --max-time 30 "$APP_URL/" -o response.json
+          cat response.json
+          python - <<'PY'
+          import json, os
+          assert json.load(open('response.json'))['commit'] == os.environ['GITHUB_SHA']
+          print('Running commit matches pushed commit')
+          PY
