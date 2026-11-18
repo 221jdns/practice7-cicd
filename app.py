@@ -6,7 +6,7 @@ def response_for(path):
     if path == "/health":
         return 200, {"status": "ok"}
     if path == "/":
-        return 200, {"service": "practice7", "message": "Practice 7 v1", "commit": os.getenv("APP_COMMIT", "local")}
+        return 200, {"service": "practice7", "message": "Practice 7 v2", "commit": os.getenv("APP_COMMIT", "local")}
     return 404, {"error": "not found"}
 
 class Handler(BaseHTTPRequestHandler):
