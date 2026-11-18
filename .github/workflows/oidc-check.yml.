@@ -1,0 +1,25 @@
+name: OIDC check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Show safe claims only
+        run: |
+          python - <<'PY'
+          import os, json, base64, urllib.request
+          req = urllib.request.Request(
+              os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=sts.amazonaws.com',
+              headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+          with urllib.request.urlopen(req) as r:
+              token = json.load(r)['value']
+          body = token.split('.')[1]
+          claims = json.loads(base64.urlsafe_b64decode(body + '=' * (-len(body) % 4)))
+          for key in ('aud', 'sub', 'repository', 'ref'):
+              print(key + ': ' + str(claims.get(key)))
+          PY
